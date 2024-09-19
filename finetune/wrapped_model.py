@@ -7,10 +7,11 @@ from typing import Callable, Union
 
 import safetensors
 import torch
-import torch.distributed.fsdp.wrap as torch_wrap
-from torch.distributed.fsdp import BackwardPrefetch
-from torch.distributed.fsdp.api import ShardingStrategy
-from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel
+# Remove FSDP imports
+# import torch.distributed.fsdp.wrap as torch_wrap
+# from torch.distributed.fsdp import BackwardPrefetch
+# from torch.distributed.fsdp.api import ShardingStrategy
+# from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel
 
 from model.args import ModelArgs, MoeArgs
 from model.transformer import Transformer, TransformerBlock
@@ -24,62 +25,22 @@ from .distributed import (
 
 logger = logging.getLogger(__name__)
 
+# This function is no longer needed without distributed support
+# def get_fsdp_policy(is_lora: bool) -> Callable[[torch.nn.Module], bool]:
+#     # Logic for FSDP wrapping is not needed on CPU
+#     return None
 
-def main_logger_info(message: str) -> None:
-    if get_rank() == 0:
-        logger.info(message)
+def log_train_params(model: torch.nn.Module):
+    # Remove world size and distributed logic
+    num_params = sum(p.numel() for p in model.parameters())
+    num_train_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-
-def get_fsdp_policy(is_lora: bool) -> Callable[[torch.nn.Module], bool]:
-    """
-    This function instantiates the FSDP wrap policy.
-    - Each Transformers block becomes its own FSDP group so that only a single Transformer block is sharded at a time
-    - If LoRA is enabled, we additionally create separate FSDP sub-groups for every trainable and non-trainable parameter group
-      since this is a requirement for mixed requires_grad=True/False training. See: https://pytorch.org/docs/stable/fsdp.html
-    """
-
-    # Each transformer block becomes a FSDP group, each being sharded separately
-    transformer_block_wrap_policy = functools.partial(
-        torch_wrap.transformer_auto_wrap_policy,
-        transformer_layer_cls=(TransformerBlock,),
+    logger.info(
+        f"{num_train_params:,.0f} out of {num_params:,.0f} parameters are finetuned "
+        f"({num_train_params / num_params * 100:.2f}%)."
     )
-
-    if not is_lora:
-        return transformer_block_wrap_policy
-
-    def fsdp_lora_policy_fn(module):
-        return all(p.requires_grad for p in module.parameters())
-
-    # For LoRA training, trainable and non-trainable parameters need to be put into
-    # different FSDP groups
-    fsdp_lora_policy = functools.partial(
-        torch_wrap.lambda_auto_wrap_policy, lambda_fn=fsdp_lora_policy_fn
-    )
-
-    policies = [fsdp_lora_policy, transformer_block_wrap_policy]
-
-    return functools.partial(torch_wrap._or_policy, policies=policies)
-
-
-def log_train_params(model: Union[torch.nn.Module, FullyShardedDataParallel]):
-    world_size = get_world_size()
-
-    num_params = world_size * sum(p.numel() for p in model.parameters())
-    num_train_params = world_size * sum(
-        p.numel() for p in model.parameters() if p.requires_grad
-    )
-
-    main_logger_info(
-        f"{num_train_params:,.0f} out of {num_params:,.0f} parameters are finetuned ({num_train_params / num_params * 100:.2f}%)."
-    )
-
 
 def initialize_lora_parameters(model: torch.nn.Module, param_dtype: torch.dtype):
-    """
-    Initialize LoRA layers with Kaiming uniform and zeros.
-    See original paper for more info: https://arxiv.org/abs/2106.09685 and
-    original github repo: https://github.com/microsoft/LoRA/blob/a0a92e0f26c067cf94747bdbf1ce73793fa44d19/loralib/layers.py#L122
-    """
     for m_name, module in model.named_modules():
         if all(p.is_meta for p in module.parameters()):
             for p_name, param in module.named_parameters():
@@ -94,7 +55,6 @@ def initialize_lora_parameters(model: torch.nn.Module, param_dtype: torch.dtype)
                     torch.nn.init.zeros_(param)
                 else:
                     raise ValueError("Only Lora layers should be randomly initialized.")
-
 
 def load_args(folder: Path, lora: LoraArgs) -> ModelArgs:
     with open(folder / "params.json", "r") as f:
@@ -120,13 +80,12 @@ def load_args(folder: Path, lora: LoraArgs) -> ModelArgs:
 
     return model_args
 
-
 def load_model(
     folder: Path,
     lora: LoraArgs,
     checkpoint: bool,
     param_dtype: torch.dtype,
-) -> FullyShardedDataParallel:
+) -> torch.nn.Module:  # Updated return type to torch.nn.Module
     model_args = load_args(folder, lora)
 
     if model_args.vocab_size == 32000:
@@ -138,42 +97,31 @@ def load_model(
         model_args.vocab_size >= 32768
     ), "Make sure to use a model with a vocab size of at least 32768"
 
-    with torch.device("meta"):
+    # Load model on CPU
+    with torch.device("cpu"):
         model = Transformer(args=model_args, checkpoint=checkpoint)
 
-    if get_rank() == 0:
-        state_dict = load_state_dict(folder, dtype=param_dtype)
+    # Load model state
+    state_dict = load_state_dict(folder, dtype=param_dtype)
+    model.load_state_dict(state_dict, assign=True)
 
-        model.load_state_dict(state_dict, assign=True)  # type: ignore
-        logger.info("Loaded model on cpu!")
+    logger.info("Loaded model on CPU!")
 
-        if lora.enable:
-            logger.info("Initializing lora layers ...")
-            # initialize LoRA layers
-            initialize_lora_parameters(model, param_dtype)
+    if lora.enable:
+        logger.info("Initializing lora layers ...")
+        initialize_lora_parameters(model, param_dtype)
 
-        assert not any(
-            p.is_meta for p in model.parameters()
-        ), "All parameters should be initialized by now"
-        assert all(
-            p.dtype == param_dtype for p in model.parameters()
-        ), f"All parameters should be on {param_dtype}"
+    # Verify all parameters are initialized
+    assert not any(
+        p.is_meta for p in model.parameters()
+    ), "All parameters should be initialized by now"
+    assert all(
+        p.dtype == param_dtype for p in model.parameters()
+    ), f"All parameters should be on {param_dtype}"
 
-        logger.info("Finished initialization!")
-        param_init_fn = None
-    else:
+    logger.info("Finished initialization!")
 
-        def param_init_fn(m):
-            m.to_empty(device=torch.cuda.current_device(), recurse=False)
-            m.to(param_dtype)
-
-        assert all(
-            p.is_meta for p in model.parameters()
-        ), "All parameters should be on meta"
-
-    torch.distributed.barrier()
-
-    # only finetune LoRA parameters and freeze before wrapping
+    # Freeze non-LoRA parameters
     if lora.enable:
         for name, param in model.named_parameters():
             if "lora" in name:
@@ -181,26 +129,9 @@ def load_model(
             else:
                 param.requires_grad = False
 
-    auto_wrap_policy = get_fsdp_policy(model_args.lora.enable)
+    log_train_params(model)
 
-    main_logger_info(f"Sharding model over {get_world_size()} GPUs ...")
-
-    wrapped_model = FullyShardedDataParallel(
-        model,
-        sharding_strategy=ShardingStrategy.FULL_SHARD,
-        auto_wrap_policy=auto_wrap_policy,
-        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-        limit_all_gathers=True,
-        device_id=torch.cuda.current_device(),
-        sync_module_states=True,
-        param_init_fn=param_init_fn,
-    )
-    main_logger_info("Model sharded!")
-
-    log_train_params(wrapped_model)
-
-    return wrapped_model
-
+    return model  # Return the regular PyTorch model without FSDP wrapping
 
 @torch.no_grad()
 def load_state_dict(path: Path, dtype: torch.dtype):

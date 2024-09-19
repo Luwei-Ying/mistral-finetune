@@ -41,7 +41,7 @@ class Checkpointer:
         self.optimizer = optimizer
         self.state = state
         self.run_dir = Path(run_dir)
-        self.rank = get_rank()
+        self.rank = 0 #get_rank()
         self.num_ckpt_keep = num_ckpt_keep
 
     @property

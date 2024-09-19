@@ -7,29 +7,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import fire
-import torch.cuda
-import torch.distributed as dist
+import torch
 from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from torch.optim import AdamW, lr_scheduler
 
 from finetune.args import TrainArgs
 from finetune.checkpointing import Checkpointer
 from finetune.data.data_loader import build_data_loader
-from finetune.distributed import (
-    BACKEND,
-    avg_aggregate,
-    get_rank,
-    get_world_size,
-    is_torchrun,
-    set_device,
-)
 from finetune.eval import evaluate
 from finetune.loss import compute_loss_with_mask
-from finetune.mixed_precision import (
-    downcast_mixed_precision,
-    prepare_mixed_precision,
-    upcast_mixed_precision,
-)
 from finetune.monitoring.metrics_logger import (
     MetricsLogger,
     eval_log_msg,
@@ -52,8 +38,7 @@ logger = logging.getLogger("train")
 
 
 def main_logger_info(message: str) -> None:
-    if get_rank() == 0:
-        logger.info(message)
+    logger.info(message)
 
 
 def train(config: str):
@@ -73,28 +58,14 @@ def _train(
     # 1. Initial setup and checks
     set_random_seed(args.seed)
 
-    # Init NCCL
-    if "LOCAL_RANK" in os.environ:
-        set_device()
-        logger.info("Going to init comms...")
-
-        dist.init_process_group(backend=BACKEND)
-    else:
-        logger.error(
-            "PyTorch environment is not correctly initialized. This message should only be displayed when testing."
-        )
+    # Ensure we are using the CPU
+    device = torch.device("cpu")
+    logger.info(f"Running on device: {device}")
 
     # 2. Init run dir
     main_logger_info(f"Run dir: {args.run_dir}")
     run_dir = Path(args.run_dir)
 
-    if is_torchrun():
-        if run_dir.exists():
-            raise RuntimeError(
-                f"Run dir {run_dir} already exists. Make sure to either rename `run_dir` or remove {run_dir}."
-            )
-
-    dist.barrier()
     run_dir.mkdir(exist_ok=True, parents=True)
 
     args_path = run_dir / "args.yaml"
@@ -103,22 +74,22 @@ def _train(
 
     main_logger_info(f"TrainArgs: {pprint.pformat(dataclasses.asdict(args))}")
 
-    # 3. Get loggers
-    metrics_logger: MetricsLogger = MetricsLogger(
+    # 3. Initialize the logger without wandb
+    metrics_logger = MetricsLogger(
         run_dir,
         tag="train",
-        is_master=get_rank() == 0,
-        wandb_args=args.wandb,
+        is_master=True,
+        # wandb_args=None,  # Skip wandb entirely
         mlflow_args=args.mlflow,
         config=dataclasses.asdict(args),
     )
     exit_stack.enter_context(logged_closing(metrics_logger, "metrics_logger"))
 
-    eval_logger: MetricsLogger = MetricsLogger(
+    eval_logger = MetricsLogger(
         run_dir,
         tag="eval",
-        is_master=get_rank() == 0,
-        wandb_args=args.wandb,
+        is_master=True,
+        # wandb_args=None,  # Skip wandb here as well
         mlflow_args=args.mlflow,
         config=dataclasses.asdict(args),
     )
@@ -147,8 +118,8 @@ def _train(
         seq_len=args.seq_len,
         batch_size=args.batch_size,
         seed=args.seed,
-        rank=get_rank(),  # DDP rank
-        world_size=get_world_size(),  # DDP world_size
+        rank=0,  # Single process, so rank is always 0
+        world_size=1,  # Single process, so world_size is always 1
         is_eval=False,
     )
 
@@ -163,17 +134,14 @@ def _train(
             seq_len=args.seq_len,
             batch_size=args.batch_size,
             seed=None,
-            rank=get_rank(),  # DDP rank
-            world_size=get_world_size(),  # DDP world_size
+            rank=0,
+            world_size=1,
             is_eval=True,
         )
-        # pre-load all eval tokens
         eval_batches = list(eval_data_loader)
 
     # 8. Load model
-    # Define mixed precision
-    param_dtype = torch.bfloat16
-    optim_dtype = torch.float32
+    param_dtype = torch.float32  # Use float32 for CPU
 
     assert args.lora is not None, "`args.lora` should be set to a valid value."
 
@@ -182,7 +150,7 @@ def _train(
         lora=args.lora,
         checkpoint=args.checkpoint,
         param_dtype=param_dtype,
-    )
+    ).to(device)  # Ensure model is loaded to CPU
 
     # 9. Load optimizer
     optimizer = AdamW(
@@ -208,16 +176,10 @@ def _train(
         state=state,
         run_dir=run_dir,
         optimizer=optimizer,
-        num_ckpt_keep=args.num_ckpt_keep,
-    )
-    # 11. Prepare mixed precision
-    prepare_mixed_precision(
-        model.parameters(), param_dtype=param_dtype, optim_dtype=optim_dtype
+        num_ckpt_keep=args.num_ckpt_keep
     )
 
-    # 12. train!
     model.train()
-    torch.cuda.empty_cache()
 
     while state.step < args.max_steps:
         state.start_step()
@@ -225,22 +187,20 @@ def _train(
 
         optimizer.zero_grad()
 
-        loss = torch.tensor([0.0], device="cuda")
+        loss = torch.tensor([0.0], device=device)
         n_batch_tokens: int = 0
 
         for i in range(args.num_microbatches):
-            # batch
             batch = next(data_loader)
 
-            x = torch.from_numpy(batch.x).cuda(non_blocking=True)
-            y = torch.from_numpy(batch.y).cuda(non_blocking=True)
+            x = torch.from_numpy(batch.x).to(device)
+            y = torch.from_numpy(batch.y).to(device)
             y_mask = (
-                torch.from_numpy(batch.y_mask).cuda(non_blocking=True)
+                torch.from_numpy(batch.y_mask).to(device)
                 if batch.y_mask is not None
                 else None
             )
 
-            # forward / backward
             output = model(
                 input_ids=x,
                 seqlens=batch.sizes,
@@ -252,51 +212,21 @@ def _train(
             loss += mb_loss.detach()
             n_batch_tokens += x.numel()
 
-            if i < args.num_microbatches - 1:
-                # synchronize CUDA to re-run backward
-                assert args.num_microbatches > 1  # should not happen
-                torch.cuda.synchronize()
+        loss /= args.num_microbatches
 
-        if args.num_microbatches > 1:
-            loss /= args.num_microbatches
-            for p in model.parameters():
-                if p.requires_grad:
-                    assert p.grad is not None
-                    p.grad.div_(args.num_microbatches)
-
-        # upcast params for optimizer update
-        upcast_mixed_precision(model.parameters(), optim_dtype=optim_dtype)
-
-        # clip grad norm
-        model.clip_grad_norm_(max_norm=args.max_norm)
-
-        # optimizer step
         optimizer.step()
-
-        # downcast params for forward & backward
-        downcast_mixed_precision(model.parameters(), param_dtype=param_dtype)
 
         last_lr = scheduler.get_last_lr()[0]
         scheduler.step()
 
-        # Host sync
         loss_item = loss.item()
-        avg_loss = avg_aggregate(loss_item)
+        avg_loss = loss_item  # Single process, no need for avg_aggregate
 
         if not args.no_eval and (
             (args.eval_freq > 0 and state.step % args.eval_freq == 0) or is_last_step
         ):
-            # write perplexity to state
             evaluate(model, eval_batches, state)
 
-            eval_logs = get_eval_logs(
-                state.step, avg_loss, state.this_eval_perplexity, state.this_eval_loss
-            )
-
-            main_logger_info(eval_log_msg(eval_logs))
-            eval_logger.log(eval_logs, step=state.step)
-
-        # Timing
         state.end_step(n_batch_tokens)
 
         if state.step % args.log_freq == 0:
@@ -304,8 +234,8 @@ def _train(
                 state,
                 avg_loss,
                 last_lr,
-                torch.cuda.max_memory_allocated(),
-                torch.cuda.memory_allocated(),
+                0,  # No GPU, so no memory tracking
+                0,  # No GPU, so no memory tracking
                 args,
             )
             main_logger_info(train_log_msg(state, logs=train_logs, loss=avg_loss))
@@ -324,5 +254,4 @@ def _train(
 
 
 if __name__ == "__main__":
-    """See README.md for usage."""
     fire.Fire(train)

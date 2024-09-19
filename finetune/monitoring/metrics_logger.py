@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional, Union
 
 from torch.utils.tensorboard import SummaryWriter
 
-from finetune.args import MLFlowArgs, TrainArgs, WandbArgs
+from finetune.args import MLFlowArgs, TrainArgs
 from finetune.utils import TrainState
 
 logger = logging.getLogger("metrics_logger")
@@ -107,7 +107,6 @@ class MetricsLogger:
         dst_dir: Path,
         tag: str,
         is_master: bool,
-        wandb_args: WandbArgs,
         mlflow_args: MLFlowArgs,
         config: Optional[Dict[str, Any]] = None,
     ):
@@ -128,28 +127,7 @@ class MetricsLogger:
             max_queue=1000,
             filename_suffix=filename_suffix,
         )
-        self.is_wandb = wandb_args.project is not None
         self.is_mlflow = mlflow_args.tracking_uri is not None
-
-        if self.is_wandb:
-            import wandb
-
-            if wandb_args.key is not None:
-                wandb.login(key=wandb_args.key)
-            if wandb_args.offline:
-                os.environ["WANDB_MODE"] = "offline"
-            if wandb.run is None:
-                logger.info("initializing wandb")
-                wandb.init(
-                    config=config,
-                    dir=dst_dir,
-                    project=wandb_args.project,
-                    job_type="training",
-                    name=wandb_args.run_name or dst_dir.name,
-                    resume=False,
-                )
-
-            self.wandb_log = wandb.log
 
         if self.is_mlflow:
             import mlflow
@@ -179,17 +157,6 @@ class MetricsLogger:
             if self.is_mlflow:
                 self.mlflow_log(f"{self.tag}.{key}", value, step=step)
 
-        if self.is_wandb:
-            # grouping in wandb is done with /
-            self.wandb_log(
-                {
-                    f"{self.tag}/{key}": value
-                    for key, value in metrics.items()
-                    if key not in metrics_to_ignore
-                },
-                step=step,
-            )
-
         metrics_: Dict[str, Any] = dict(metrics)  # shallow copy
         if "step" in metrics_:
             assert step == metrics_["step"]
@@ -206,12 +173,6 @@ class MetricsLogger:
         if self.summary_writer is not None:
             self.summary_writer.close()
             self.summary_writer = None
-
-        if self.is_wandb:
-            import wandb
-
-            # to be sure we are not hanging while finishing
-            wandb.finish()
 
         if self.is_mlflow:
             import mlflow

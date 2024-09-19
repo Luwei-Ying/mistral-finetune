@@ -13,7 +13,8 @@ BACKEND = "nccl"
 
 @lru_cache()
 def get_rank() -> int:
-    return dist.get_rank()
+    return 0
+    #return dist.get_rank()
 
 
 @lru_cache()

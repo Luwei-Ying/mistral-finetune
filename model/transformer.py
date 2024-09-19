@@ -5,8 +5,6 @@ from typing import Iterable, List, Optional, Union
 import torch
 import torch.distributed.algorithms._checkpoint.checkpoint_wrapper as torch_ckpt
 import torch.nn as nn
-from xformers.ops.fmha import memory_efficient_attention
-from xformers.ops.fmha.attn_bias import AttentionBias, BlockDiagonalCausalMask
 
 from .args import ModelArgs
 from .lora import LoRALinear
@@ -56,6 +54,7 @@ class Attention(nn.Module):
 
         MaybeLora = maybe_lora_layer(args)
 
+        # Linear projections for queries, keys, and values
         self.wq = MaybeLora(args.dim, args.n_heads * args.head_dim, bias=False)
         self.wk = MaybeLora(args.dim, args.n_kv_heads * args.head_dim, bias=False)
         self.wv = MaybeLora(args.dim, args.n_kv_heads * args.head_dim, bias=False)
@@ -66,27 +65,44 @@ class Attention(nn.Module):
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
-        mask: AttentionBias,
+        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         seqlen_sum, _ = x.shape
 
+        # Compute queries, keys, values
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
+        # Reshape for multi-head attention
         xq = xq.view(seqlen_sum, self.n_heads, self.args.head_dim)
         xk = xk.view(seqlen_sum, self.n_kv_heads, self.args.head_dim)
         xv = xv.view(seqlen_sum, self.n_kv_heads, self.args.head_dim)
+
+        # Apply rotary embeddings
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        key, val = xk, xv
+        # Repeat keys and values to match the number of query heads
+        key, val = repeat_kv(xk, xv, self.repeats, dim=1)
 
-        # Repeat keys and values to match number of query heads
-        key, val = repeat_kv(key, val, self.repeats, dim=1)
+        # Scale queries
+        xq = xq * self.scale
 
-        # xformers requires (B=1, S, H, D)
-        xq, key, val = xq[None, ...], key[None, ...], val[None, ...]
-        output = memory_efficient_attention(xq, key, val, mask)
+        # Calculate attention scores (QK^T)
+        attn_scores = torch.einsum('bhd,bhd->bh', xq, key)
 
-        return self.wo(output.view(seqlen_sum, -1))
+        # Apply attention mask if provided
+        if mask is not None:
+            attn_scores = attn_scores + mask
+
+        # Convert scores to probabilities
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+
+        # Calculate weighted sum of values
+        attn_output = torch.einsum('bh,bhd->bhd', attn_weights, val)
+
+        # Combine heads and project output
+        output = self.wo(attn_output.reshape(seqlen_sum, -1))
+
+        return output
 
 
 class FeedForward(nn.Module):
@@ -141,7 +157,7 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
-        att_mask: AttentionBias,
+        att_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r = self.attention(self.attention_norm(x), freqs_cis, att_mask)
         h = x + r
@@ -212,7 +228,7 @@ class Transformer(nn.Module):
 
         h = self.tok_embeddings(input_ids)
         positions = positions_from_sizes(seqlens, self.freqs_cis.device)
-        att_mask = BlockDiagonalCausalMask.from_seqlens(seqlens)
+        att_mask = None  # BlockDiagonalCausalMask removed
 
         freqs_cis = self.freqs_cis[positions].to(device=h.device)
 
